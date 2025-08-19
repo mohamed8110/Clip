@@ -52,14 +52,18 @@ def wrap_text(draw, text, font, max_width):
     if cur: lines.append(cur)
     return lines
 
-def make_overlay(w, h, title, desc,
-                 font_size=58, txt="#000000",
-                 bar="#FFFFFF", opacity=0.85, top=220, padding=24, radius=28):
-    """Witte (semi-transparante) balk met titel + beschrijving."""
+def make_overlay(
+    w, h, title, desc,
+    title_font_size=58, desc_font_size=40,
+    txt="#000000", bar="#FFFFFF",
+    opacity=0.85, top=220, padding=24, radius=28
+):
+    """Witte (semi-transparante) balk met titel + beschrijving.
+       Titel- en beschrijving-fontsize zijn onafhankelijk instelbaar."""
     img = Image.new("RGBA", (w, h), (0,0,0,0))
     d   = ImageDraw.Draw(img)
-    fT  = load_font(font_size)
-    fD  = load_font(max(28, int(font_size*0.55)))
+    fT  = load_font(title_font_size)
+    fD  = load_font(desc_font_size)
 
     lines = []
     max_w = int(w*0.9)
@@ -73,11 +77,15 @@ def make_overlay(w, h, title, desc,
         f  = fT if kind in ("t","gap") else fD
         bb = d.textbbox((0,0), ln, font=f)
         lw = bb[2]-bb[0]
-        lh = (bb[3]-bb[1]) if ln else int(font_size*0.35)
+        if ln:
+            lh = bb[3]-bb[1]
+        else:
+            # visuele tussenruimte tussen titel en beschrijving
+            lh = max(12, int(min(title_font_size, desc_font_size) * 0.35))
         widths.append(lw); heights.append(lh)
 
     txt_w = max(widths) if widths else 0
-    txt_h = sum(heights) + (len(lines)-1)*int(font_size*0.25)
+    txt_h = sum(heights) + (len(lines)-1)*int(min(title_font_size, desc_font_size)*0.25)
 
     box_w = min(txt_w + padding*2, int(w*0.95))
     box_h = txt_h + padding*2
@@ -94,12 +102,13 @@ def make_overlay(w, h, title, desc,
 
     # Tekst
     ty = y + padding
+    spacing = int(min(title_font_size, desc_font_size) * 0.25)
     for i,(kind, ln) in enumerate(lines):
         f = fT if kind in ("t","gap") else fD
         lw = d.textbbox((0,0), ln, font=f)[2]
         lx = x + (box_w - lw)//2
         if ln: d.text((lx, ty), ln, font=f, fill=txt)
-        ty += heights[i] + int(font_size*0.25)
+        ty += heights[i] + spacing
 
     return img
 
@@ -135,11 +144,12 @@ title = st.text_input("Titel", "Voorbeeldtitel")
 desc  = st.text_area("Korte beschrijving", "Korte uitleg of context bij dit nieuws.")
 
 with st.expander("Stijl"):
-    font_size   = st.slider("Titel lettergrootte", 36, 96, 58)
+    title_font_size = st.slider("Titel lettergrootte", 36, 96, 58)
+    desc_font_size  = st.slider("Beschrijving lettergrootte", 20, 96, 40)
     text_color  = st.color_picker("Tekstkleur", "#000000")
     bar_color   = st.color_picker("Balkkleur", "#FFFFFF")
     bar_opacity = st.slider("Balk opaciteit", 0.0, 1.0, 0.85)
-    top_offset  = st.slider("Titelpositie (px vanaf boven)", 0, 800, 220)
+    top_offset  = st.slider("Titel/tekst positie (px vanaf boven)", 0, 800, 220)
     logo_width  = st.slider("Logo breedte (px)", 80, 400, 200)
 
 if st.button("▶️ Render 30s video"):
@@ -162,7 +172,13 @@ if st.button("▶️ Render 30s video"):
 
         step.write("🖼️ Overlay renderen…")
         prog.progress(35)
-        ov_img  = make_overlay(W, H, title, desc, font_size, text_color, bar_color, bar_opacity, top_offset)
+        ov_img  = make_overlay(
+            W, H, title, desc,
+            title_font_size=title_font_size,
+            desc_font_size=desc_font_size,
+            txt=text_color, bar=bar_color,
+            opacity=bar_opacity, top=top_offset
+        )
         ov_clip = ImageClip(np.array(ov_img)).set_duration(TARGET_DURATION)
 
         # Logo
@@ -199,8 +215,10 @@ if st.button("▶️ Render 30s video"):
         out_path = os.path.join(OUT_DIR, f"{sanitize(title)}.mp4")
         step.write("💾 Exporteren naar MP4…")
         prog.progress(90)
-        final.write_videofile(out_path, fps=30, codec="libx264", audio_codec="aac",
-                              threads=4, preset="medium")
+        final.write_videofile(
+            out_path, fps=30, codec="libx264", audio_codec="aac",
+            threads=4, preset="faster"   # iets sneller renderen
+        )
 
         try:
             if audioclip: audioclip.close()
