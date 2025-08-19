@@ -1,258 +1,250 @@
-# streamlit_app.py  (FFmpeg-variant, snel renderen)
-import os, re, time, shlex, subprocess, tempfile, shutil
+# streamlit_app.py — MoviePy, sneller renderen met lagere resolutie/kwaliteit
+import os, re, time
+import numpy as np
 import streamlit as st
+from PIL import Image, ImageDraw, ImageFont
 
+# --- Pillow compat: LANCZOS + alias voor ANTIALIAS (Pillow 10+) ---
+try:
+    _RESAMPLING = Image.Resampling.LANCZOS  # Pillow 10+
+except AttributeError:
+    _RESAMPLING = Image.LANCZOS             # oudere Pillow
+if not hasattr(Image, "ANTIALIAS"):
+    Image.ANTIALIAS = _RESAMPLING
+
+# --- Paden/constanten ---
 APP_DIR = os.path.dirname(__file__)
-BG_VIDEO = os.path.join(APP_DIR, "background.mp4")
-LOGO     = os.path.join(APP_DIR, "default_logo.png")
-MUSIC    = os.path.join(APP_DIR, "news_tune.mp3")
+BG_VIDEO = os.path.join(APP_DIR, "background.mp4")       # vaste video
+MUSIC    = os.path.join(APP_DIR, "news_tune.mp3")        # vast geluid (optioneel)
+LOGO     = os.path.join(APP_DIR, "default_logo.png")     # vast logo
 OUT_DIR  = os.path.join(APP_DIR, "output")
 os.makedirs(OUT_DIR, exist_ok=True)
 
-TARGET_DURATION = 30  # seconden hard cap
+TARGET_DURATION = 30   # SEC — ALTIJD MAX 30s
+TARGET_FPS = 24        # Lager fps = sneller renderen
 
-st.set_page_config(page_title="MNWS TikTok — FFmpeg snel", layout="centered")
-st.title("🎬 MNWS TikTok — FFmpeg (snel), 30s hard cap")
+st.set_page_config(page_title="MNWS TikTok — sneller renderen", layout="centered")
+st.title("🎬 MNWS TikTok — vaste video + audio + logo (snel, 30s)")
 
-# ---------- helpers ----------
-def find_font():
-    """Zoek een bruikbaar TTF font voor drawtext (Windows/Linux/Cloud)."""
-    candidates = [
-        "C:/Windows/Fonts/segoeuib.ttf",
-        "C:/Windows/Fonts/segoeui.ttf",
-        "C:/Windows/Fonts/arialbd.ttf",
-        "C:/Windows/Fonts/arial.ttf",
+# ----------------- Helpers -----------------
+def load_font(size: int):
+    for p in [
+        "C:/Windows/Fonts/segoeuib.ttf", "C:/Windows/Fonts/segoeui.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",  "C:/Windows/Fonts/arial.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ]
-    for p in candidates:
+    ]:
         if os.path.isfile(p):
-            return p
-    return None
+            try:
+                return ImageFont.truetype(p, size=size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
 
-def hex_to_rgba_str(hex_color, alpha):
-    """'#RRGGBB' -> 'r:g:b@alpha' voor drawtext boxcolor."""
-    if not hex_color.startswith("#"):
-        return f"255:255:255@{alpha}"
-    if len(hex_color) == 4:
-        hex_color = "#" + "".join([c*2 for c in hex_color[1:]])
-    r = int(hex_color[1:3], 16)
-    g = int(hex_color[3:5], 16)
-    b = int(hex_color[5:7], 16)
-    return f"{r}:{g}:{b}@{alpha}"
+def wrap_text(draw, text, font, max_width):
+    words, lines, cur = text.split(), [], ""
+    for w in words:
+        t = (cur + " " + w).strip()
+        if draw.textbbox((0, 0), t, font=font)[2] <= max_width or not cur:
+            cur = t
+        else:
+            lines.append(cur); cur = w
+    if cur: lines.append(cur)
+    return lines
 
-def hex_to_rgb_str(hex_color):
-    if not hex_color.startswith("#"):
-        return "255:255:255"
-    if len(hex_color) == 4:
-        hex_color = "#" + "".join([c*2 for c in hex_color[1:]])
-    r = int(hex_color[1:3], 16)
-    g = int(hex_color[3:5], 16)
-    b = int(hex_color[5:7], 16)
-    return f"{r}:{g}:{b}"
+def make_overlay(
+    w, h, title, desc,
+    title_font_size=58, desc_font_size=40,
+    txt="#000000", bar="#FFFFFF",
+    opacity=0.85, top=220, padding=24, radius=28
+):
+    """Witte (semi-transparante) balk met titel + beschrijving (onafhankelijke fontgroottes)."""
+    img = Image.new("RGBA", (w, h), (0,0,0,0))
+    d   = ImageDraw.Draw(img)
+    fT  = load_font(title_font_size)
+    fD  = load_font(desc_font_size)
 
-def ensure_ffmpeg():
-    exe = shutil.which("ffmpeg")
-    if not exe:
-        st.error("❌ FFmpeg niet gevonden. Installeer FFmpeg en voeg het toe aan je PATH.\n\n"
-                 "- Windows: download een build van https://www.gyan.dev/ffmpeg/builds/ (release full) en voeg de map `bin` toe aan PATH.\n"
-                 "- macOS: `brew install ffmpeg`\n"
-                 "- Linux/Cloud: meestal al aanwezig.")
-        st.stop()
-    return exe
+    lines = []
+    max_w = int(w*0.9)
+    for ln in wrap_text(d, title, fT, max_w): lines.append(("t", ln))
+    if desc.strip():
+        lines.append(("gap",""))
+        for ln in wrap_text(d, desc, fD, max_w): lines.append(("d", ln))
 
-def write_textfile(txt: str):
-    """Schrijf tekst naar tijdelijk bestand (om escaping-gedoe in drawtext te vermijden)."""
-    tf = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w", encoding="utf-8")
-    tf.write(txt.replace("\r\n", "\n").replace("\r", "\n"))
-    tf.flush()
-    tf.close()
-    return tf.name
+    heights, widths = [], []
+    for kind, ln in lines:
+        f  = fT if kind in ("t","gap") else fD
+        bb = d.textbbox((0,0), ln, font=f)
+        lw = bb[2]-bb[0]
+        if ln:
+            lh = bb[3]-bb[1]
+        else:
+            lh = max(12, int(min(title_font_size, desc_font_size) * 0.35))
+        widths.append(lw); heights.append(lh)
 
-def build_ffmpeg_cmd(ffmpeg, W, H, logo_w, title_txt, desc_txt,
-                     title_fs, desc_fs, title_y, desc_y,
-                     text_rgb, box_rgba, box_border, out_path):
-    """
-    Bouw één ffmpeg command dat:
-      - background.mp4 covert naar 30s (loop/trim) en cover-cropt naar (W,H)
-      - logo scaled en overlay linksboven
-      - titel + desc met drawtext (box=1)
-      - audio trimmed naar 30s met fade in/out en volume
-    """
+    txt_w = max(widths) if widths else 0
+    txt_h = sum(heights) + (len(lines)-1)*int(min(title_font_size, desc_font_size)*0.25)
 
-    # Inputs:
-    #  0: background
-    #  1: logo (png)
-    #  2: music (mp3) (optioneel)
-    inputs = [
-        "-stream_loop", "-1",  # loop de input (alleen geldig voor sommige containers; we cap met -t)
-        "-t", str(TARGET_DURATION),
-        "-i", BG_VIDEO,
-        "-i", LOGO,
-    ]
-    have_music = os.path.isfile(MUSIC)
-    if have_music:
-        inputs += ["-i", MUSIC]
+    box_w = min(txt_w + padding*2, int(w*0.95))
+    box_h = txt_h + padding*2
+    x = (w - box_w)//2
+    y = max(0, min(h - box_h, top))
 
-    # Tekst via textfile (betrouwbaar i.v.m. escaping)
-    title_file = write_textfile(title_txt)
-    desc_file  = write_textfile(desc_txt)
+    # Balkkleur
+    r,g,b = (255,255,255)
+    if bar.startswith("#") and len(bar) in (4,7):
+        if len(bar)==4: bar = "#" + "".join([c*2 for c in bar[1:]])
+        r,g,b = int(bar[1:3],16), int(bar[3:5],16), int(bar[5:7],16)
+    a = int(255*float(opacity))
+    d.rounded_rectangle((x,y,x+box_w,y+box_h), radius=radius, fill=(r,g,b,a))
 
-    fontfile = find_font()
-    if not fontfile:
-        st.warning("⚠️ Geen systeemfont gevonden — FFmpeg drawtext kan falen zonder fontfile.")
-        fontfile = ""  # laat ffmpeg zelf kiezen (kan mislukken)
+    # Tekst
+    ty = y + padding
+    spacing = int(min(title_font_size, desc_font_size) * 0.25)
+    for i,(kind, ln) in enumerate(lines):
+        f = fT if kind in ("t","gap") else fD
+        lw = d.textbbox((0,0), ln, font=f)[2]
+        lx = x + (box_w - lw)//2
+        if ln: d.text((lx, ty), ln, font=f, fill=txt)
+        ty += heights[i] + spacing
 
-    # kleurstrings
-    fontcolor = f"rgb({text_rgb})"
-    boxcolor  = f"{box_rgba}"  # r:g:b@a
-    # overlay pipeline:
-    # [0:v] scale+crop -> [bg]
-    # [1:v] scale logo -> [logo]
-    # [bg][logo] overlay -> [v0]
-    # [v0] drawtext (title) -> [v1]
-    # [v1] drawtext (desc)  -> [v]
-    vf = [
-        f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
-        f"crop={W}:{H}[bg];"
-        f"[1:v]scale={logo_w}:-1[logo];"
-        f"[bg][logo]overlay=24:24[v0];"
-        f"[v0]drawtext=fontfile='{fontfile}':"
-        f"textfile='{title_file}':"
-        f"fontsize={title_fs}:fontcolor={fontcolor}:"
-        f"x=(w-text_w)/2:y={title_y}:"
-        f"box=1:boxcolor={boxcolor}:boxborderw={box_border}[v1];"
-        f"[v1]drawtext=fontfile='{fontfile}':"
-        f"textfile='{desc_file}':"
-        f"fontsize={desc_fs}:fontcolor={fontcolor}:"
-        f"x=(w-text_w)/2:y={desc_y}:"
-        f"box=1:boxcolor={boxcolor}:boxborderw={box_border}[v]"
-    ]
-    vmap = ["-map", "[v]"]
+    return img
 
-    # audio: trim/fade/volume
-    if have_music:
-        # cut to 30s, fade in/out, volume 0.5
-        af = f"atrim=0:{TARGET_DURATION},afade=t=in:ss=0:d=0.6,afade=t=out:st={TARGET_DURATION-0.6}:d=0.6,volume=0.5"
-        amap = ["-map", "2:a", "-af", af]
+def sanitize(text: str) -> str:
+    text = re.sub(r"[^\w\-]+","_", text.strip())
+    return text[:60].strip("_") or f"video_{int(time.time())}"
+
+def make_cover_video(video_path, W, H, duration=30):
+    """Altijd exact 'duration' seconden: subclip of loop, daarna hard cap; cover crop naar (W,H)."""
+    from moviepy.editor import VideoFileClip
+    clip = VideoFileClip(video_path)
+
+    if clip.duration >= duration:
+        base = clip.subclip(0, duration)
     else:
-        # geen audio
-        amap = []
+        loops = int(duration // clip.duration) + 1
+        base = clip.loop(n=loops).subclip(0, duration)
 
-    # encoding
-    enc = [
-        "-shortest",
-        "-t", str(TARGET_DURATION),
-        "-c:v", "libx264",
-        "-preset", "faster",
-        "-r", "30",
-        "-pix_fmt", "yuv420p",
-    ]
-    if have_music:
-        enc += ["-c:a", "aac", "-b:a", "128k"]
+    # schalen en croppen naar W×H
+    scale = max(W/base.w, H/base.h)
+    base = base.resize(scale).crop(
+        x_center=base.w*scale/2,
+        y_center=base.h*scale/2,
+        width=W,
+        height=H
+    )
 
-    cmd = [ffmpeg, "-y"] + inputs + [
-        "-filter_complex", vf[0],
-    ] + vmap + amap + enc + [out_path]
+    # extra zekerheid: hard cap
+    return base.subclip(0, duration)
 
-    return cmd, (title_file, desc_file)
-
-def run_ffmpeg_with_progress(cmd, duration_s=30):
-    """
-    Draai ffmpeg en update Streamlit progress o.b.v. 'time=' uit stderr.
-    """
-    prog = st.progress(0)
-    status = st.empty()
-
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
-    last_pct = 0
-    try:
-        while True:
-            line = proc.stderr.readline()
-            if not line:
-                if proc.poll() is not None:
-                    break
-                time.sleep(0.05)
-                continue
-            if "time=" in line:
-                # parse tijdcode
-                # e.g. time=00:00:12.34
-                try:
-                    tstr = line.split("time=")[1].split(" ")[0].strip()
-                    hh, mm, ss = tstr.split(":")
-                    cur = float(hh)*3600 + float(mm)*60 + float(ss)
-                    pct = int(min(100, max(0, (cur / duration_s) * 100)))
-                    if pct != last_pct:
-                        prog.progress(pct)
-                        status.write(f"🚧 Renderen… {pct}%")
-                        last_pct = pct
-                except Exception:
-                    pass
-    finally:
-        proc.wait()
-    if proc.returncode != 0:
-        raise RuntimeError("FFmpeg faalde. Check of FFmpeg aanwezig is en of de bestanden kloppen.")
-    prog.progress(100)
-    status.write("✅ Klaar!")
-
-# ---------- UI ----------
-title   = st.text_input("Titel", "Voorbeeldtitel")
-desc    = st.text_area("Korte beschrijving", "Korte uitleg of context bij dit nieuws.")
+# ----------------- UI -----------------
+title = st.text_input("Titel", "Voorbeeldtitel")
+desc  = st.text_area("Korte beschrijving", "Korte uitleg of context bij dit nieuws.")
 
 col1, col2 = st.columns(2)
 with col1:
-    res = st.selectbox("Resolutie (vertical)", ["1080x1920", "720x1280"], index=0)
-    W, H = map(int, res.split("x"))
-    logo_w = st.slider("Logo breedte (px)", 80, 600, 220)
-    box_opacity = st.slider("Box opaciteit", 0.0, 1.0, 0.85)
+    res = st.selectbox("Resolutie (vertical)", ["1080x1920 (HQ)", "720x1280 (sneller)"], index=1)
+    if res.startswith("1080"):
+        W, H = 1080, 1920
+    else:
+        W, H = 720, 1280
+    logo_width  = st.slider("Logo breedte (px)", 80, int(W*0.8), min(220, int(W*0.4)))
+    top_offset  = st.slider("Titel/tekst positie (px vanaf boven)", 0, int(H*0.8), int(H*0.20))
 with col2:
-    title_fs = st.slider("Titel fontsize", 30, 120, 64)
-    desc_fs  = st.slider("Beschrijving fontsize", 20, 100, 42)
-    title_y  = st.slider("Titel Y (px vanaf boven)", 0, H-200, int(H*0.20))
-    desc_y   = st.slider("Beschrijving Y (px vanaf boven)", 0, H-100, int(H*0.55))
+    title_font_size = st.slider("Titel lettergrootte", 28, 120, 56 if W==720 else 58)
+    desc_font_size  = st.slider("Beschrijving lettergrootte", 20, 100, 36 if W==720 else 40)
+    text_color  = st.color_picker("Tekstkleur", "#000000")
+    bar_color   = st.color_picker("Balkkleur", "#FFFFFF")
+    bar_opacity = st.slider("Balk opaciteit", 0.0, 1.0, 0.85)
 
-text_color = st.color_picker("Tekstkleur", "#000000")
-box_color  = st.color_picker("Boxkleur", "#FFFFFF")
-
-if st.button("▶️ Render 30s video (FFmpeg)"):
+if st.button("▶️ Render 30s video (sneller)"):
     try:
-        if not os.path.isfile(BG_VIDEO):
-            st.error("'background.mp4' ontbreekt in deze map.")
-            st.stop()
-        if not os.path.isfile(LOGO):
-            st.error("'default_logo.png' ontbreekt in deze map.")
-            st.stop()
+        # Preflight
+        if not os.path.isfile(BG_VIDEO): st.error("'background.mp4' ontbreekt"); st.stop()
+        if not os.path.isfile(LOGO):     st.error("'default_logo.png' ontbreekt"); st.stop()
 
-        ffmpeg = ensure_ffmpeg()
+        # Imports pas hier (betere foutmelding als package mist)
+        from moviepy.editor import ImageClip, AudioFileClip, CompositeVideoClip, afx
 
-        out_name = re.sub(r"[^\w\-]+","_", title.strip()) or f"video_{int(time.time())}"
-        out_path = os.path.join(OUT_DIR, f"{out_name}_{W}x{H}.mp4")
+        # Vooruitgang UI
+        step = st.empty()
+        prog = st.progress(0)
+        step.write("🎞️ Video voorbereiden…")
+        prog.progress(10)
 
-        text_rgb = hex_to_rgb_str(text_color)
-        box_rgba = hex_to_rgba_str(box_color, box_opacity)
+        # Video: ALTIJD exact 30s, cover crop naar gekozen resolutie
+        bg = make_cover_video(BG_VIDEO, W, H, duration=TARGET_DURATION)
 
-        cmd, tmp_txts = build_ffmpeg_cmd(
-            ffmpeg, W, H, logo_w,
-            title_txt=title, desc_txt=desc,
-            title_fs=title_fs, desc_fs=desc_fs,
-            title_y=title_y, desc_y=desc_y,
-            text_rgb=text_rgb, box_rgba=box_rgba, box_border=20,
-            out_path=out_path
+        step.write("🖼️ Overlay renderen…")
+        prog.progress(35)
+        ov_img  = make_overlay(
+            W, H, title, desc,
+            title_font_size=title_font_size,
+            desc_font_size=desc_font_size,
+            txt=text_color, bar=bar_color,
+            opacity=bar_opacity, top=top_offset
+        )
+        ov_clip = ImageClip(np.array(ov_img)).set_duration(TARGET_DURATION)
+
+        # Logo
+        step.write("🏷️ Logo plaatsen…")
+        prog.progress(55)
+        pil_logo = Image.open(LOGO).convert("RGBA")
+        ratio    = logo_width / pil_logo.width
+        pil_logo = pil_logo.resize((logo_width, int(pil_logo.height*ratio)), _RESAMPLING)
+        logo_clip= ImageClip(np.array(pil_logo)).set_duration(TARGET_DURATION).set_position((24,24))
+
+        # Compositie
+        step.write("🎬 Compositie samenstellen…")
+        prog.progress(70)
+        layers = [bg, ov_clip, logo_clip]
+        final  = CompositeVideoClip(layers, size=(W, H))
+
+        # Audio (altijd hard cap 30s, NIET loopen)
+        audioclip = None
+        if os.path.isfile(MUSIC):
+            try:
+                step.write("🔊 Audio knippen tot 30s…")
+                prog.progress(80)
+                whole = AudioFileClip(MUSIC)
+                audioclip = whole.subclip(0, min(TARGET_DURATION, getattr(whole, "duration", TARGET_DURATION)))
+                # Fade in/out + volume
+                audioclip = afx.audio_fadein(audioclip, 0.6)
+                audioclip = afx.audio_fadeout(audioclip, 0.6)
+                audioclip = audioclip.volumex(0.5)
+                final = final.set_audio(audioclip)
+            except Exception:
+                pass
+
+        # Export — lagere kwaliteit/meer snelheid:
+        # - preset="veryfast" (sneller) 
+        # - CRF 27 (kleinere file; hoger getal = lagere kwaliteit/snellere encoding)
+        out_path = os.path.join(OUT_DIR, f"{sanitize(title)}_{W}x{H}_24fps.mp4")
+        step.write("💾 Exporteren naar MP4…")
+        prog.progress(90)
+        final.write_videofile(
+            out_path,
+            fps=TARGET_FPS,
+            codec="libx264",
+            audio_codec="aac",
+            threads=4,
+            preset="veryfast",
+            ffmpeg_params=["-crf", "27", "-pix_fmt", "yuv420p"]
         )
 
-        st.write("🛠️ FFmpeg command:")
-        st.code(" ".join(shlex.quote(c) for c in cmd), language="bash")
+        try:
+            if audioclip: audioclip.close()
+            final.close()
+        except Exception:
+            pass
 
-        run_ffmpeg_with_progress(cmd, duration_s=TARGET_DURATION)
-
-        # opruimen temp textfiles
-        for p in tmp_txts:
-            try: os.unlink(p)
-            except Exception: pass
-
+        prog.progress(100)
+        step.write("✅ Klaar!")
         st.success(f"Gereed: {os.path.basename(out_path)}")
         with open(out_path, "rb") as f:
             st.download_button("⬇ Download MP4", f, file_name=os.path.basename(out_path), mime="video/mp4")
 
+    except ModuleNotFoundError as e:
+        st.error(f"Package ontbreekt: {e}. Installeer met:  pip install streamlit moviepy Pillow numpy imageio imageio-ffmpeg")
     except Exception as e:
         st.error(f"Fout bij renderen: {e}")
