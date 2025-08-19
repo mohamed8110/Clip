@@ -1,4 +1,4 @@
-# streamlit_app.py — MoviePy, sneller renderen met lagere resolutie/kwaliteit
+# streamlit_app.py — MoviePy + gTTS (vrouwelijke AI-stem), 30s cap, snel renderen
 import os, re, time
 import numpy as np
 import streamlit as st
@@ -23,8 +23,8 @@ os.makedirs(OUT_DIR, exist_ok=True)
 TARGET_DURATION = 30   # SEC — ALTIJD MAX 30s
 TARGET_FPS = 24        # Lager fps = sneller renderen
 
-st.set_page_config(page_title="MNWS TikTok — sneller renderen", layout="centered")
-st.title("🎬 MNWS TikTok — vaste video + audio + logo (snel, 30s)")
+st.set_page_config(page_title="MNWS TikTok — TTS (vrouw)", layout="centered")
+st.title("🎬 MNWS TikTok — vaste video + logo + muziek + AI-stem (vrouw)")
 
 # ----------------- Helpers -----------------
 def load_font(size: int):
@@ -157,14 +157,22 @@ with col2:
     bar_color   = st.color_picker("Balkkleur", "#FFFFFF")
     bar_opacity = st.slider("Balk opaciteit", 0.0, 1.0, 0.85)
 
-if st.button("▶️ Render 30s video (sneller)"):
+st.markdown("---")
+st.subheader("🔊 AI‑stem (vrouw) — gratis (gTTS)")
+use_tts   = st.checkbox("Voice-over inschakelen", value=True)
+tts_lang  = st.selectbox("Taal", ["nl", "ar", "fr", "en"], index=0)
+read_mode = st.radio("Wat laten voorlezen?", ["Alleen titel", "Titel + beschrijving"], index=0)
+music_under = st.checkbox("Muziek zacht eronder mixen", value=True)
+
+if st.button("▶️ Render 30s video (met AI‑stem)"):
     try:
         # Preflight
         if not os.path.isfile(BG_VIDEO): st.error("'background.mp4' ontbreekt"); st.stop()
         if not os.path.isfile(LOGO):     st.error("'default_logo.png' ontbreekt"); st.stop()
 
-        # Imports pas hier (betere foutmelding als package mist)
-        from moviepy.editor import ImageClip, AudioFileClip, CompositeVideoClip, afx
+        # Imports pas hier (duidelijkere foutmelding bij ontbrekende pkg)
+        from moviepy.editor import ImageClip, AudioFileClip, CompositeVideoClip, CompositeAudioClip, afx
+        from gtts import gTTS
 
         # Vooruitgang UI
         step = st.empty()
@@ -200,26 +208,40 @@ if st.button("▶️ Render 30s video (sneller)"):
         layers = [bg, ov_clip, logo_clip]
         final  = CompositeVideoClip(layers, size=(W, H))
 
-        # Audio (altijd hard cap 30s, NIET loopen)
-        audioclip = None
-        if os.path.isfile(MUSIC):
+        # --- AUDIO: gTTS (vrouw) + optionele muziek onder ---
+        step.write("🔊 Voice‑over genereren…")
+        prog.progress(80)
+        voice_clip = None
+        if use_tts:
+            text_to_read = title if read_mode == "Alleen titel" else f"{title}. {desc}"
+            tts_path = os.path.join(OUT_DIR, "voiceover.mp3")
             try:
-                step.write("🔊 Audio knippen tot 30s…")
-                prog.progress(80)
-                whole = AudioFileClip(MUSIC)
-                audioclip = whole.subclip(0, min(TARGET_DURATION, getattr(whole, "duration", TARGET_DURATION)))
-                # Fade in/out + volume
-                audioclip = afx.audio_fadein(audioclip, 0.6)
-                audioclip = afx.audio_fadeout(audioclip, 0.6)
-                audioclip = audioclip.volumex(0.5)
-                final = final.set_audio(audioclip)
-            except Exception:
-                pass
+                gTTS(text=text_to_read, lang=tts_lang, slow=False).save(tts_path)
+                voice_clip = AudioFileClip(tts_path)
+                # fade & cap
+                voice_clip = afx.audio_fadein(voice_clip, 0.1)
+                voice_clip = afx.audio_fadeout(voice_clip, 0.2)
+                voice_clip = voice_clip.subclip(0, min(TARGET_DURATION, getattr(voice_clip, "duration", TARGET_DURATION)))
+            except Exception as e:
+                st.warning(f"Kon TTS niet genereren ({e}). Ga door zonder voice-over.")
+
+        final_audio = None
+        if music_under and os.path.isfile(MUSIC):
+            music_clip = AudioFileClip(MUSIC).subclip(0, min(TARGET_DURATION, getattr(AudioFileClip(MUSIC), "duration", TARGET_DURATION)))
+            music_clip = afx.audio_fadein(music_clip, 0.6)
+            music_clip = afx.audio_fadeout(music_clip, 0.6).volumex(0.15)  # zacht onder voice
+            if voice_clip:
+                final_audio = CompositeAudioClip([music_clip, voice_clip]).set_duration(TARGET_DURATION)
+            else:
+                final_audio = music_clip.set_duration(TARGET_DURATION)
+        elif voice_clip:
+            final_audio = voice_clip.set_duration(TARGET_DURATION)
+
+        if final_audio:
+            final = final.set_audio(final_audio)
 
         # Export — lagere kwaliteit/meer snelheid:
-        # - preset="veryfast" (sneller) 
-        # - CRF 27 (kleinere file; hoger getal = lagere kwaliteit/snellere encoding)
-        out_path = os.path.join(OUT_DIR, f"{sanitize(title)}_{W}x{H}_24fps.mp4")
+        out_path = os.path.join(OUT_DIR, f"{sanitize(title)}_{W}x{H}_24fps_TTS.mp4")
         step.write("💾 Exporteren naar MP4…")
         prog.progress(90)
         final.write_videofile(
@@ -233,7 +255,7 @@ if st.button("▶️ Render 30s video (sneller)"):
         )
 
         try:
-            if audioclip: audioclip.close()
+            if final.audio: final.audio.close()
             final.close()
         except Exception:
             pass
@@ -245,6 +267,6 @@ if st.button("▶️ Render 30s video (sneller)"):
             st.download_button("⬇ Download MP4", f, file_name=os.path.basename(out_path), mime="video/mp4")
 
     except ModuleNotFoundError as e:
-        st.error(f"Package ontbreekt: {e}. Installeer met:  pip install streamlit moviepy Pillow numpy imageio imageio-ffmpeg")
+        st.error(f"Package ontbreekt: {e}. Installeer met:  pip install streamlit moviepy Pillow numpy imageio imageio-ffmpeg gTTS")
     except Exception as e:
         st.error(f"Fout bij renderen: {e}")
